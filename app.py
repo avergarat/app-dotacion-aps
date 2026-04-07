@@ -13,6 +13,11 @@ from copy import deepcopy
 import openpyxl
 from openpyxl.utils import get_column_letter
 import warnings, gc, os, sys, shutil, tempfile, sqlite3, io, hmac
+try:
+    import libsql_experimental as libsql
+    _HAS_LIBSQL = True
+except ImportError:
+    _HAS_LIBSQL = False
 from datetime import datetime, date, time as dt_time
 from docx import Document as DocxDocument
 from docx.shared import Pt, Inches, Cm, RGBColor
@@ -596,32 +601,102 @@ def save_dot_ideal_sheet(path: str, df_dot_raw: pd.DataFrame):
 
 
 # ─────────────────────────────────────────────────────────────
-# SQLite PERSISTENCIA
+# DB PERSISTENCIA  (Turso / SQLite local fallback)
 # ─────────────────────────────────────────────────────────────
 _TABLE_MAIN = "dotacion_main"
 _TABLE_HORAS = "horas_indirectas"
 _TABLE_DOT = "dot_ideal"
 
+_TURSO_CONN = None
+_USE_TURSO = False
+
+
+def _get_conn():
+    """Retorna conexión a Turso (si hay secrets) o SQLite local."""
+    global _TURSO_CONN, _USE_TURSO
+    turso_url = ""
+    turso_token = ""
+    try:
+        turso_url = st.secrets.get("TURSO_URL", "")
+        turso_token = st.secrets.get("TURSO_TOKEN", "")
+    except Exception:
+        pass
+    if turso_url and turso_token and _HAS_LIBSQL:
+        _USE_TURSO = True
+        if _TURSO_CONN is None:
+            _TURSO_CONN = libsql.connect(
+                str(_DB_PATH), sync_url=turso_url, auth_token=turso_token
+            )
+            _TURSO_CONN.sync()
+        return _TURSO_CONN
+    else:
+        _USE_TURSO = False
+        return sqlite3.connect(str(_DB_PATH))
+
+
+def _close_conn(con):
+    """Cierra la conexión solo si es SQLite local (Turso se reutiliza)."""
+    if not _USE_TURSO:
+        con.close()
+
+
+def _sync():
+    """Sincroniza con Turso (push/pull) si está activo."""
+    if _TURSO_CONN is not None:
+        _TURSO_CONN.sync()
+
+
+def _df_to_sql(df: pd.DataFrame, table_name: str, con):
+    """Guarda DataFrame en tabla SQL — compatible con sqlite3 y libsql."""
+    try:
+        df.to_sql(table_name, con, if_exists="replace", index=False)
+    except (TypeError, AttributeError):
+        cur = con.cursor()
+        cur.execute(f'DROP TABLE IF EXISTS [{table_name}]')
+        cols = df.columns.tolist()
+        col_defs = ", ".join([f'[{c}] TEXT' for c in cols])
+        cur.execute(f'CREATE TABLE [{table_name}] ({col_defs})')
+        placeholders = ", ".join(["?" for _ in cols])
+        col_names = ", ".join([f'[{c}]' for c in cols])
+        for _, row in df.iterrows():
+            values = tuple(None if pd.isna(v) else v for v in row)
+            cur.execute(f'INSERT INTO [{table_name}] ({col_names}) VALUES ({placeholders})', values)
+        con.commit()
+
+
+def _read_sql(query: str, con) -> pd.DataFrame:
+    """Lee query SQL a DataFrame — compatible con sqlite3 y libsql."""
+    try:
+        return pd.read_sql(query, con)
+    except (TypeError, AttributeError):
+        cur = con.cursor()
+        cur.execute(query)
+        rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame()
+        cols = [desc[0] for desc in cur.description]
+        return pd.DataFrame(rows, columns=cols)
+
 
 def db_has_data() -> bool:
-    """Retorna True si la BD existe y tiene registros."""
-    if not _DB_PATH.exists():
-        return False
+    """Retorna True si la BD tiene registros."""
     try:
-        con = sqlite3.connect(str(_DB_PATH))
+        con = _get_conn()
+        _sync()
         cur = con.execute(f"SELECT COUNT(*) FROM {_TABLE_MAIN}")
         n = cur.fetchone()[0]
-        con.close()
+        _close_conn(con)
         return n > 0
     except Exception:
         return False
 
 
 def db_save_main(df: pd.DataFrame):
-    """Guarda el DataFrame principal en SQLite (reemplaza la tabla completa)."""
-    con = sqlite3.connect(str(_DB_PATH))
-    df.to_sql(_TABLE_MAIN, con, if_exists="replace", index=False)
-    con.close()
+    """Guarda el DataFrame principal (reemplaza la tabla completa)."""
+    con = _get_conn()
+    _df_to_sql(df, _TABLE_MAIN, con)
+    _sync()
+    _close_conn(con)
 
 
 def _normalize_cesfam_col(df: pd.DataFrame) -> pd.DataFrame:
@@ -639,10 +714,11 @@ def _normalize_cesfam_col(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def db_load_main() -> pd.DataFrame:
-    """Carga el DataFrame principal desde SQLite."""
-    con = sqlite3.connect(str(_DB_PATH))
-    df = pd.read_sql(f"SELECT * FROM {_TABLE_MAIN}", con)
-    con.close()
+    """Carga el DataFrame principal desde la BD."""
+    con = _get_conn()
+    _sync()
+    df = _read_sql(f"SELECT * FROM {_TABLE_MAIN}", con)
+    _close_conn(con)
     # Restaurar tipos numéricos
     for col in ["Horas por contrato", "Horas Totales",
                 "Total Descuentos semanal (horas)", "Total Horas Clínicas"]:
@@ -688,24 +764,24 @@ def db_merge_new_ruts(df_existing: pd.DataFrame, df_excel: pd.DataFrame) -> pd.D
 
 
 def db_save_horas(df: pd.DataFrame):
-    """Guarda la tabla Horas Indirectas en SQLite."""
-    con = sqlite3.connect(str(_DB_PATH))
-    df.to_sql(_TABLE_HORAS, con, if_exists="replace", index=False)
-    con.close()
+    """Guarda la tabla Horas Indirectas."""
+    con = _get_conn()
+    _df_to_sql(df, _TABLE_HORAS, con)
+    _sync()
+    _close_conn(con)
 
 
 def db_load_horas() -> pd.DataFrame | None:
-    """Carga Horas Indirectas desde SQLite."""
-    if not _DB_PATH.exists():
-        return None
+    """Carga Horas Indirectas desde la BD."""
     try:
-        con = sqlite3.connect(str(_DB_PATH))
+        con = _get_conn()
+        _sync()
         cur = con.execute(f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{_TABLE_HORAS}'")
         if cur.fetchone()[0] == 0:
-            con.close()
+            _close_conn(con)
             return None
-        df = pd.read_sql(f"SELECT * FROM {_TABLE_HORAS}", con)
-        con.close()
+        df = _read_sql(f"SELECT * FROM {_TABLE_HORAS}", con)
+        _close_conn(con)
         if df.empty:
             return None
         for col in df.columns[1:]:
@@ -716,24 +792,24 @@ def db_load_horas() -> pd.DataFrame | None:
 
 
 def db_save_dot(df: pd.DataFrame):
-    """Guarda la tabla DOT IDEAL procesada en SQLite."""
-    con = sqlite3.connect(str(_DB_PATH))
-    df.to_sql(_TABLE_DOT, con, if_exists="replace", index=False)
-    con.close()
+    """Guarda la tabla DOT IDEAL procesada."""
+    con = _get_conn()
+    _df_to_sql(df, _TABLE_DOT, con)
+    _sync()
+    _close_conn(con)
 
 
 def db_load_dot() -> pd.DataFrame | None:
-    """Carga DOT IDEAL desde SQLite."""
-    if not _DB_PATH.exists():
-        return None
+    """Carga DOT IDEAL desde la BD."""
     try:
-        con = sqlite3.connect(str(_DB_PATH))
+        con = _get_conn()
+        _sync()
         cur = con.execute(f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{_TABLE_DOT}'")
         if cur.fetchone()[0] == 0:
-            con.close()
+            _close_conn(con)
             return None
-        df = pd.read_sql(f"SELECT * FROM {_TABLE_DOT}", con)
-        con.close()
+        df = _read_sql(f"SELECT * FROM {_TABLE_DOT}", con)
+        _close_conn(con)
         if df.empty:
             return None
         for col in df.columns:
