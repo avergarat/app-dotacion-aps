@@ -348,10 +348,10 @@ def _ensure_readable(path: Path) -> str:
         raise PermissionError(f"No se puede acceder al archivo: {path}")
 
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=300)
 def load_excel(path: str, _mtime: float, sheet_main: str | None = None):
     """Carga las 3 hojas como DataFrames. Cache invalidado por mtime."""
-    _sheet = sheet_main or st.session_state.get("_selected_sheet", SHEET_MAIN)
+    _sheet = sheet_main or SHEET_MAIN
     # ── Hoja principal ──
     df_main = pd.read_excel(path, sheet_name=_sheet, header=1, dtype=str)
     # Normalizar nombres de columna (pueden tener saltos de línea por celdas merge)
@@ -789,15 +789,17 @@ def db_merge_new_ruts(df_existing: pd.DataFrame, df_excel: pd.DataFrame) -> pd.D
     """Compara RUTs del Excel con los existentes en BD.
     Solo agrega personas NUEVAS (RUT no presente en BD), marcándolas como _ES_NUEVO.
     """
-    existing_ruts = set(df_existing["RUT"].dropna().astype(str).str.strip())
-    excel_ruts = set(df_excel["RUT"].dropna().astype(str).str.strip())
+    def norm_rut(val):
+        return str(val).replace(".", "").replace("-", "").strip().upper()
+    existing_ruts = set(df_existing["RUT"].dropna().apply(norm_rut))
+    excel_ruts = set(df_excel["RUT"].dropna().apply(norm_rut))
 
     new_ruts = excel_ruts - existing_ruts
     if not new_ruts:
         return df_existing, 0
 
     # Filtrar solo filas con RUTs nuevos
-    df_new = df_excel[df_excel["RUT"].astype(str).str.strip().isin(new_ruts)].copy()
+    df_new = df_excel[df_excel["RUT"].dropna().apply(norm_rut).isin(new_ruts)].copy()
     df_new["_ES_NUEVO"] = True
     df_new["REVISADO"] = ""
 
@@ -936,7 +938,7 @@ init_state()
 # CARGA DE DATOS
 # ─────────────────────────────────────────────────────────────
 def load_data():
-    """Carga datos: prefiere SQLite si existe, si no carga desde Excel."""
+    """Carga datos: prefiere SQLite si existe, si no carga desde Excel y persiste."""
     # 1) Intentar cargar desde SQLite (revisión guardada)
     if db_has_data():
         df_main = db_load_main()
@@ -950,40 +952,43 @@ def load_data():
             st.session_state.horas_lookup = build_horas_lookup(_df_h)
         if _df_d is not None:
             st.session_state.df_dot = _df_d
-        # Si faltan en SQLite, intentar cargar del Excel
         if _df_h is None or _df_d is None:
             _load_secondary_sheets()
         return True
 
-    # 2) Si no hay BD, cargar desde Excel (primera vez)
-    path = st.session_state.excel_path
-    if path is None:
-        return False
-    p = Path(path)
-    if not p.exists():
-        st.error(f"Archivo no encontrado: {path}")
-        return False
-    readable_path = _ensure_readable(p)
-    mtime = Path(readable_path).stat().st_mtime
-    df_main, df_horas, df_dot_raw = load_excel(readable_path, mtime)
-    df_main = df_main.reset_index(drop=True)
-    # Normalizar CESFAM
-    df_main = _normalize_cesfam_col(df_main)
-    # Agregar columna de control
-    df_main["_ES_NUEVO"] = False
-    st.session_state.df_main = df_main
-    st.session_state.df_horas = df_horas.reset_index(drop=True)
-    st.session_state.df_dot_raw = df_dot_raw
-    st.session_state.df_dot = parse_dot_ideal(df_dot_raw)
-    st.session_state.horas_lookup = build_horas_lookup(df_horas)
-    st.session_state._loaded_from = "excel"
-    # Guardar inmediatamente en SQLite (las 3 tablas)
-    db_save_main(st.session_state.df_main)
-    if st.session_state.df_horas is not None:
-        db_save_horas(st.session_state.df_horas)
-    if st.session_state.df_dot is not None and not st.session_state.df_dot.empty:
-        db_save_dot(st.session_state.df_dot)
-    return True
+    # 2) Sin BD → intentar cargar desde Excel si hay uno disponible
+    path = st.session_state.get("excel_path")
+    if path and Path(path).exists():
+        try:
+            with st.spinner("Cargando datos desde Excel..."):
+                readable = _ensure_readable(Path(path))
+                mtime = Path(readable).stat().st_mtime
+                sheet = st.session_state.get("_selected_sheet", SHEET_MAIN)
+                df_main, df_horas, df_dot_raw = load_excel(readable, mtime, sheet_main=sheet)
+                df_main = _normalize_cesfam_col(df_main.reset_index(drop=True))
+                df_main["_ES_NUEVO"] = False
+                st.session_state.df_main = df_main
+                st.session_state._loaded_from = "excel"
+                st.session_state.df_horas = df_horas.reset_index(drop=True)
+                st.session_state.df_dot_raw = df_dot_raw
+                st.session_state.df_dot = parse_dot_ideal(df_dot_raw)
+                st.session_state.horas_lookup = build_horas_lookup(df_horas)
+                # Persistir en SQLite para carga rápida en el futuro
+                db_save_main(st.session_state.df_main)
+                db_save_horas(st.session_state.df_horas)
+                if st.session_state.df_dot is not None and not st.session_state.df_dot.empty:
+                    db_save_dot(st.session_state.df_dot)
+            st.toast("Datos cargados y guardados correctamente", icon="✅")
+            return True
+        except Exception as e:
+            st.error(f"Error al cargar Excel: {e}")
+            # No cambiar df_main para que pueda reintentarse en el próximo rerun
+            return False
+
+    # 3) Sin BD ni Excel disponible
+    st.warning("No hay datos guardados. Por favor, cargue un archivo Excel para iniciar.")
+    # No asignar df_main aquí para permitir reintentos automáticos
+    return False
 
 
 def _load_secondary_sheets():
@@ -1052,6 +1057,9 @@ def render_sidebar():
         st.caption("Gestión de Dotación Marzo 2026")
         st.divider()
 
+        # Evaluar una sola vez si hay datos en BD (evita múltiples conexiones SQLite)
+        _bd_tiene_datos = db_has_data()
+
         # ── Carga de archivo Excel mediante botón ──
         uploaded = st.file_uploader(
             "📁 Seleccionar archivo Excel",
@@ -1079,7 +1087,7 @@ def render_sidebar():
         _has_file = st.session_state.get("excel_path") and Path(st.session_state.excel_path).exists()
 
         if not _has_file:
-            if not db_has_data():
+            if not _bd_tiene_datos:
                 st.info("Suba un archivo .xlsx para comenzar")
                 st.stop()
             # Sin archivo pero con BD existente → cargar desde SQLite
@@ -1120,7 +1128,7 @@ def render_sidebar():
                         if st.session_state.df_main is not None and len(st.session_state.df_main) > 0:
                             df_merged, n_new = db_merge_new_ruts(st.session_state.df_main, df_new)
                             st.session_state.df_main = df_merged.reset_index(drop=True)
-                        elif db_has_data():
+                        elif _bd_tiene_datos:
                             existing = db_load_main()
                             df_merged, n_new = db_merge_new_ruts(existing, df_new)
                             st.session_state.df_main = df_merged.reset_index(drop=True)
@@ -1139,9 +1147,8 @@ def render_sidebar():
                     st.rerun()
 
         if st.session_state.df_main is None:
-            with st.spinner("Cargando datos..."):
-                if not load_data():
-                    st.stop()
+            if not load_data():
+                st.stop()
 
         st.divider()
         nav = st.radio(
@@ -1186,7 +1193,7 @@ def render_sidebar():
         st.divider()
 
         # Estado de la BD
-        if db_has_data():
+        if _bd_tiene_datos:
             st.caption("💾 Auto-guardado activo · BD local")
         else:
             st.caption("📭 Sin revisión guardada")
@@ -1645,75 +1652,68 @@ def page_editor(filtros):
 
     st.markdown('<div class="section-title">Tabla Editable — Doble clic en celda para editar · Seleccione fila para asignar encomendaciones</div>', unsafe_allow_html=True)
 
-    # Contenedores reservados ARRIBA de la tabla
-    cargo_metrics_container = st.container()
+
+    # ── Editor de encomendaciones (ANTES de la tabla, solo usa la fila seleccionada) ──
     encom_editor_container = st.container()
-
-    # ── Barra de métricas + brecha (aparece con filtros, sin necesidad de seleccionar fila) ──
-    with cargo_metrics_container:
-        _ht, _ds, _hc = "Horas Totales", "Total Descuentos semanal (horas)", "Total Horas Clínicas"
-        n_cargo = len(dff)
-        s_ht = dff[_ht].sum() if _ht in dff.columns else 0
-        s_ds = dff[_ds].sum() if _ds in dff.columns else 0
-        s_hc = dff[_hc].sum() if _hc in dff.columns else 0
-        s_jn = s_hc / 44 if s_hc > 0 else 0
-
-        # Determinar categoría DOT y CESFAM únicos del filtro para brecha
-        _brecha_html = ""
-        unique_cargos = dff["CARGO"].dropna().str.strip().unique().tolist() if "CARGO" in dff.columns else []
-        unique_dot_cols = set()
-        for c in unique_cargos:
-            if not c:
-                continue
-            dc = CARGO_DOT_MAP.get(c, CARGO_DOT_MAP.get(c.upper()))
-            if dc:
-                unique_dot_cols.add(dc)
-        unique_cesfams = dff["CESFAM"].unique().tolist() if "CESFAM" in dff.columns else []
-        df_dot = st.session_state.get("df_dot", None)
-
-        if len(unique_dot_cols) == 1 and len(unique_cesfams) == 1 and df_dot is not None and not df_dot.empty:
-            dot_col = list(unique_dot_cols)[0]
-            cesfam_val = unique_cesfams[0]
-            jn_real = s_jn
-            ideal_val = None
-            matched_cesfam = match_cesfam_to_dot(cesfam_val, df_dot)
-            if matched_cesfam:
-                dot_row_match = df_dot[df_dot["CESFAM"].astype(str).str.strip() == matched_cesfam]
-                if not dot_row_match.empty and dot_col in dot_row_match.columns:
-                    v = dot_row_match.iloc[0][dot_col]
-                    if pd.notna(v):
-                        ideal_val = float(v)
-            if ideal_val is not None:
-                diff = jn_real - ideal_val
-                if diff < -0.05:
-                    _brecha_html = (f' · <span style="background:#EF4444;padding:2px 8px;border-radius:4px;'
-                                    f'font-weight:700;">⚠️ DÉFICIT {dot_col}: {diff:.2f} jorn. '
-                                    f'(Real: {jn_real:.2f} · {n_cargo} func. en {cesfam_val} / Ideal: {ideal_val:.0f})</span>')
-                elif diff > 0.05:
-                    _brecha_html = (f' · <span style="background:#FACC15;color:#000;padding:2px 8px;border-radius:4px;'
-                                    f'font-weight:700;">📈 SUPERÁVIT {dot_col}: +{diff:.2f} jorn. '
-                                    f'(Real: {jn_real:.2f} · {n_cargo} func. en {cesfam_val} / Ideal: {ideal_val:.0f})</span>')
-                else:
-                    _brecha_html = (f' · <span style="background:#22C55E;padding:2px 8px;border-radius:4px;'
-                                    f'font-weight:700;">✅ EQUILIBRIO {dot_col} '
-                                    f'(Real: {jn_real:.2f} · {n_cargo} func. en {cesfam_val} / Ideal: {ideal_val:.0f})</span>')
-
-        # Etiqueta: categoría DOT si es única, lista de cargos si no
-        if len(unique_dot_cols) == 1:
-            _lbl = list(unique_dot_cols)[0]
-        elif f_cargo:
-            _lbl = ", ".join(f_cargo[:3]) + ("..." if len(f_cargo) > 3 else "")
-        elif f_planta:
-            _lbl = ", ".join(f_planta[:3]) + ("..." if len(f_planta) > 3 else "")
+    _active_rut = st.session_state.get("_sel_rut", None)
+    row = None
+    real_idx = None
+    if _active_rut:
+        match_mask = df["RUT"].astype(str).str.strip() == _active_rut
+        if match_mask.any():
+            real_idx = df[match_mask].index[0]
+            row = df.loc[real_idx]
         else:
-            _lbl = "Todos"
-
-        st.markdown(f"""<div style="background:linear-gradient(135deg,#0A2E1F,#145A38);
-            color:#fff; padding:.6rem 1rem; border-radius:8px; margin:.4rem 0;
-            border-left:5px solid #4ADE80;">
-            <strong>📊 {_lbl}</strong> — {n_cargo} funcionarios en tabla ·
-            Σ Hrs Tot: {s_ht:.0f} · Σ Desc: {s_ds:.1f} · Σ Clínicas: {s_hc:.1f} · Jornadas: {s_jn:.2f}{_brecha_html}
-        </div>""", unsafe_allow_html=True)
+            # Si el RUT seleccionado ya no está, limpiar selección
+            st.session_state.pop("_sel_rut", None)
+    with encom_editor_container:
+        if row is not None:
+            nombre = str(row.get("NOMBRE PROFESIONAL", "")) if pd.notna(row.get("NOMBRE PROFESIONAL")) else ""
+            rut = str(row.get("RUT", "")) if pd.notna(row.get("RUT")) else ""
+            cargo = str(row.get("CARGO", "")) if pd.notna(row.get("CARGO")) else ""
+            cesfam = str(row.get("CESFAM", "")) if pd.notna(row.get("CESFAM")) else ""
+            hrs_tot = float(row.get("Horas Totales", 0)) if pd.notna(row.get("Horas Totales")) else 0
+            lookup = st.session_state.horas_lookup
+            activity_names = sorted(lookup.keys())
+            current_encom_str = str(row.get("ENCOMENDACIONES", "")) if pd.notna(row.get("ENCOMENDACIONES")) else ""
+            current_items = [x.strip() for x in current_encom_str.split("|") if x.strip()] if current_encom_str.strip() else []
+            st.markdown(f"""<div style="background:#F0FDF4; border:1px solid #4ADE80; padding:.5rem .8rem;
+                        border-radius:6px; margin:.3rem 0 .5rem 0;">
+                <span style="color:#0A2E1F; font-weight:600;">✏️ {nombre}</span>
+                <span style="color:#666; font-size:.82rem;"> · {rut} · {cargo} · {cesfam} · {hrs_tot:.0f} hrs</span>
+            </div>""", unsafe_allow_html=True)
+            new_items = st.multiselect(
+                "🔍 Encomendaciones (escriba para buscar actividades)",
+                options=activity_names,
+                default=[x for x in current_items if x in activity_names],
+                key=f"encom_ms_{real_idx}",
+                placeholder="Escriba para buscar y agregar actividades...",
+            )
+            total_desc = sum(lookup.get(item, 0) for item in new_items)
+            hrs_cli = hrs_tot - total_desc
+            jornadas = hrs_cli / 44 if hrs_cli > 0 else 0
+            info_col, btn_col = st.columns([4, 1])
+            with info_col:
+                st.caption(f"Descuentos: {total_desc:.2f} · Hrs Clínicas: {hrs_cli:.2f} · Jornadas: {jornadas:.2f} · Actividades: {len(new_items)}")
+            with btn_col:
+                new_encom_str = " | ".join(sorted(new_items))
+                old_sorted = " | ".join(sorted(current_items))
+                if new_encom_str != old_sorted:
+                    if st.button("✅ Aplicar", type="primary", key=f"apply_{real_idx}"):
+                        st.session_state.df_main.at[real_idx, "ENCOMENDACIONES"] = new_encom_str
+                        st.session_state.df_main.at[real_idx, "Total Descuentos semanal (horas)"] = total_desc
+                        st.session_state.df_main.at[real_idx, "Total Horas Clínicas"] = hrs_cli
+                        st.session_state.df_main.at[real_idx, "REVISADO"] = "OK"
+                        db_save_main(st.session_state.df_main)
+                        st.session_state.dirty_main = False
+                        st.session_state["_ag_version"] = st.session_state.get("_ag_version", 0) + 1
+                        st.toast(f"Encomendaciones de {nombre} guardadas", icon="💾")
+                        st.rerun()
+        else:
+            st.markdown("""<div style="background:#F0FDF4; border:1px solid #BBF7D0; padding:.6rem 1rem;
+                border-radius:8px; color:#666; font-size:.85rem;">
+                ℹ️ Seleccione una fila para editar encomendaciones.
+            </div>""", unsafe_allow_html=True)
 
     # Columnas a mostrar
     display_cols = ["REVISADO", "TIPO", "RUT", "CESFAM", "NOMBRE PROFESIONAL",
@@ -1727,13 +1727,37 @@ def page_editor(filtros):
     if n_nuevos > 0:
         st.markdown(f'<div class="warn-banner">🆕 {n_nuevos} persona(s) nueva(s) importada(s) desde Excel — resaltadas en la tabla</div>', unsafe_allow_html=True)
 
-    # Preparar dataframe para tabla editable
-    dff_edit = dff[all_cols].copy()
-    # Guardar índices reales para sincronización
-    dff_edit["_real_idx"] = dff.index
-    # Indicador NUEVO visible
+
+    # ── Paginación real ──
+    PAGE_SIZE = 100
+    total_rows = len(dff)
+    total_pages = (total_rows - 1) // PAGE_SIZE + 1
+    page_num = st.session_state.get("_editor_page", 1)
+    if page_num < 1:
+        page_num = 1
+    if page_num > total_pages:
+        page_num = total_pages
+    start_idx = (page_num - 1) * PAGE_SIZE
+    end_idx = start_idx + PAGE_SIZE
+    dff_page = dff.iloc[start_idx:end_idx]
+
+    # Navegación de páginas
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col1:
+        if st.button("⬅️ Anterior", disabled=(page_num == 1)):
+            st.session_state["_editor_page"] = page_num - 1
+            st.rerun()
+    with col2:
+        st.markdown(f"<div style='text-align:center; font-size:0.95rem; margin-top:0.5rem;'>Página <b>{page_num}</b> de <b>{total_pages}</b> ({total_rows:,} registros)</div>", unsafe_allow_html=True)
+    with col3:
+        if st.button("Siguiente ➡️", disabled=(page_num == total_pages)):
+            st.session_state["_editor_page"] = page_num + 1
+            st.rerun()
+
+    dff_edit = dff_page[all_cols].copy()
+    dff_edit["_real_idx"] = dff_page.index
     if "_ES_NUEVO" in dff.columns:
-        dff_edit.insert(0, "🆕", dff["_ES_NUEVO"].map({True: "🆕", False: ""}).fillna(""))
+        dff_edit.insert(0, "🆕", dff_page["_ES_NUEVO"].map({True: "🆕", False: ""}).fillna(""))
     else:
         dff_edit.insert(0, "🆕", "")
 
@@ -1802,6 +1826,7 @@ def page_editor(filtros):
         },
     }
 
+
     response = AgGrid(
         dff_edit,
         gridOptions=grid_options,
@@ -1814,7 +1839,19 @@ def page_editor(filtros):
         key=f"ag_main_{st.session_state.get('_ag_version', 0)}",
     )
 
-    # ── Sincronizar ediciones del usuario ──
+    # Solo sincronizar selección, no todo el estado
+    selected = response.selected_rows if hasattr(response, "selected_rows") else None
+    if selected is not None:
+        if isinstance(selected, pd.DataFrame) and len(selected) > 0:
+            sel_row_data = selected.iloc[0]
+            sel_rut = str(sel_row_data.get("RUT", "")).strip()
+            st.session_state["_sel_rut"] = sel_rut
+        elif isinstance(selected, list) and len(selected) > 0:
+            sel_row_data = selected[0]
+            sel_rut = str(sel_row_data.get("RUT", "")).strip()
+            st.session_state["_sel_rut"] = sel_rut
+
+    # Sincronizar ediciones SOLO si hay cambios
     edited_df = response.data if hasattr(response, "data") else None
     if isinstance(edited_df, pd.DataFrame) and not edited_df.empty:
         for col in all_cols:
@@ -1837,114 +1874,25 @@ def page_editor(filtros):
                         st.session_state.df_main.at[real_idx_i, "Total Horas Clínicas"] = ht - td
                     st.session_state.dirty_main = True
 
-    # Auto-guardar si hubo cambios
     if st.session_state.dirty_main:
         db_save_main(st.session_state.df_main)
         st.session_state.dirty_main = False
         st.session_state["_ag_version"] = st.session_state.get("_ag_version", 0) + 1
         st.rerun()
 
-    # ── Detectar fila seleccionada para encomendaciones ──
-    selected = response.selected_rows if hasattr(response, "selected_rows") else None
-    _has_sel = False
-    sel_row_data = None
-    try:
-        if selected is not None:
-            if isinstance(selected, pd.DataFrame) and len(selected) > 0:
-                _has_sel = True
-                sel_row_data = selected.iloc[0]
-            elif isinstance(selected, list) and len(selected) > 0:
-                _has_sel = True
-                sel_row_data = pd.Series(selected[0])
-    except Exception:
-        _has_sel = False
-
-    if _has_sel and sel_row_data is not None:
-        sel_rut = str(sel_row_data.get("RUT", "")).strip()
-        st.session_state["_sel_rut"] = sel_rut
-
-    # Usar la última selección guardada (persiste aunque se deseleccione)
-    _active_rut = st.session_state.get("_sel_rut", None)
-    if _active_rut:
-        match_mask = dff["RUT"].astype(str).str.strip() == _active_rut
-        if match_mask.any():
-            real_idx = dff[match_mask].index[0]
-            row = st.session_state.df_main.loc[real_idx]
-
-            nombre = str(row.get("NOMBRE PROFESIONAL", "")) if pd.notna(row.get("NOMBRE PROFESIONAL")) else ""
-            rut = str(row.get("RUT", "")) if pd.notna(row.get("RUT")) else ""
-            cargo = str(row.get("CARGO", "")) if pd.notna(row.get("CARGO")) else ""
-            cesfam = str(row.get("CESFAM", "")) if pd.notna(row.get("CESFAM")) else ""
-            hrs_tot = float(row.get("Horas Totales", 0)) if pd.notna(row.get("Horas Totales")) else 0
-
-            # ── Editor de encomendaciones (arriba de la tabla) ──
-            with encom_editor_container:
-                lookup = st.session_state.horas_lookup
-                activity_names = sorted(lookup.keys())
-
-                current_encom_str = str(row.get("ENCOMENDACIONES", "")) if pd.notna(row.get("ENCOMENDACIONES")) else ""
-                current_items = [x.strip() for x in current_encom_str.split("|") if x.strip()] if current_encom_str.strip() else []
-
-                st.markdown(f"""<div style="background:#F0FDF4; border:1px solid #4ADE80; padding:.5rem .8rem;
-                            border-radius:6px; margin:.3rem 0 .5rem 0;">
-                    <span style="color:#0A2E1F; font-weight:600;">✏️ {nombre}</span>
-                    <span style="color:#666; font-size:.82rem;"> · {rut} · {cargo} · {cesfam} · {hrs_tot:.0f} hrs</span>
-                </div>""", unsafe_allow_html=True)
-
-                new_items = st.multiselect(
-                    "🔍 Encomendaciones (escriba para buscar actividades)",
-                    options=activity_names,
-                    default=[x for x in current_items if x in activity_names],
-                    key=f"encom_ms_{real_idx}",
-                    placeholder="Escriba para buscar y agregar actividades...",
-                )
-
-                total_desc = sum(lookup.get(item, 0) for item in new_items)
-                hrs_cli = hrs_tot - total_desc
-                jornadas = hrs_cli / 44 if hrs_cli > 0 else 0
-
-                info_col, btn_col = st.columns([4, 1])
-                with info_col:
-                    st.caption(f"Descuentos: {total_desc:.2f} · Hrs Clínicas: {hrs_cli:.2f} · Jornadas: {jornadas:.2f} · Actividades: {len(new_items)}")
-                with btn_col:
-                    new_encom_str = " | ".join(sorted(new_items))
-                    old_sorted = " | ".join(sorted(current_items))
-                    if new_encom_str != old_sorted:
-                        if st.button("✅ Aplicar", type="primary", key=f"apply_{real_idx}"):
-                            st.session_state.df_main.at[real_idx, "ENCOMENDACIONES"] = new_encom_str
-                            st.session_state.df_main.at[real_idx, "Total Descuentos semanal (horas)"] = total_desc
-                            st.session_state.df_main.at[real_idx, "Total Horas Clínicas"] = hrs_cli
-                            st.session_state.df_main.at[real_idx, "REVISADO"] = "OK"
-                            db_save_main(st.session_state.df_main)
-                            st.session_state.dirty_main = False
-                            st.session_state["_ag_version"] = st.session_state.get("_ag_version", 0) + 1
-                            st.toast(f"Encomendaciones de {nombre} guardadas", icon="💾")
-                            st.rerun()
-        else:
-            # RUT seleccionado no está en el filtro actual
-            with encom_editor_container:
-                st.markdown("""<div style="background:#F0FDF4; border:1px solid #BBF7D0; padding:.6rem 1rem;
-                    border-radius:8px; color:#666; font-size:.85rem;">
-                    ℹ️ La persona seleccionada no está en la vista filtrada actual. Seleccione otra fila.
-                </div>""", unsafe_allow_html=True)
-    else:
-        pass
-
 
 def recalculate_hours(df: pd.DataFrame):
     """Recalcula Total Descuentos y Total Horas Clínicas basado en ENCOMENDACIONES."""
     lookup = st.session_state.horas_lookup
-    for idx, row in df.iterrows():
-        total_desc = 0.0
-        encom_str = str(row.get("ENCOMENDACIONES", "")) if pd.notna(row.get("ENCOMENDACIONES", "")) else ""
-        if encom_str.strip():
-            items = [x.strip() for x in encom_str.split("|")]
-            for item in items:
-                if item:
-                    total_desc += lookup.get(item, 0)
-        df.at[idx, "Total Descuentos semanal (horas)"] = total_desc
-        horas_tot = row["Horas Totales"] if pd.notna(row.get("Horas Totales")) else 0
-        df.at[idx, "Total Horas Clínicas"] = float(horas_tot) - total_desc
+
+    def _calc_desc(encom_str):
+        if not encom_str or not str(encom_str).strip():
+            return 0.0
+        return sum(lookup.get(item.strip(), 0) for item in str(encom_str).split("|") if item.strip())
+
+    df["Total Descuentos semanal (horas)"] = df["ENCOMENDACIONES"].fillna("").apply(_calc_desc)
+    hrs_tot = pd.to_numeric(df["Horas Totales"], errors="coerce").fillna(0)
+    df["Total Horas Clínicas"] = hrs_tot - df["Total Descuentos semanal (horas)"]
 
 
 # ─────────────────────────────────────────────────────────────
