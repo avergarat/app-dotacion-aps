@@ -693,16 +693,17 @@ def _turso_save_df(df, table_name):
         f'CREATE TABLE [{table_name}] ({col_defs})',
     ])
     col_names = ", ".join([f'[{c}]' for c in cols])
-    BATCH = 80
-    for start in range(0, len(df), BATCH):
-        chunk = df.iloc[start:start + BATCH]
-        ph_row = "(" + ", ".join(["?" for _ in cols]) + ")"
-        ph_all = ", ".join([ph_row] * len(chunk))
-        args = []
-        for _, row in chunk.iterrows():
-            for v in row:
-                args.append(_to_turso_arg(v))
-        _turso_http([{"sql": f"INSERT INTO [{table_name}] ({col_names}) VALUES {ph_all}", "args": args}])
+    placeholders = ", ".join(["?" for _ in cols])
+    BATCH = 20  # statements per pipeline call
+    stmts = []
+    for _, row in df.iterrows():
+        args = [_to_turso_arg(v) for v in row]
+        stmts.append({"sql": f"INSERT INTO [{table_name}] ({col_names}) VALUES ({placeholders})", "args": args})
+        if len(stmts) >= BATCH:
+            _turso_http(stmts)
+            stmts = []
+    if stmts:
+        _turso_http(stmts)
 
 
 # ── Funciones de persistencia (dual: Turso + SQLite local) ──
