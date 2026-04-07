@@ -671,37 +671,48 @@ def _turso_exec_single(sql):
 
 
 def _to_turso_arg(v):
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return {"type": "null"}
-    if isinstance(v, bool):
-        return {"type": "integer", "value": str(int(v))}
-    if isinstance(v, (int, np.integer)):
-        return {"type": "integer", "value": str(int(v))}
-    if isinstance(v, (float, np.floating)):
-        return {"type": "float", "value": str(float(v))}
+    try:
+        if v is None or pd.isna(v):
+            return {"type": "null"}
+    except (ValueError, TypeError):
+        pass
     return {"type": "text", "value": str(v)}
 
 
 def _turso_save_df(df, table_name):
-    """Guarda DataFrame completo en Turso via HTTP (DROP+CREATE+INSERT)."""
+    """Guarda DataFrame completo en Turso via HTTP (DROP+CREATE+INSERT).
+    Usa tabla temporal para evitar pérdida de datos si falla el INSERT.
+    """
     cols = df.columns.tolist()
     col_defs = ", ".join([f'[{c}] TEXT' for c in cols])
+    tmp_name = f"_tmp_{table_name}"
+    # Crear tabla temporal
     _turso_http([
-        f'DROP TABLE IF EXISTS [{table_name}]',
-        f'CREATE TABLE [{table_name}] ({col_defs})',
+        f'DROP TABLE IF EXISTS [{tmp_name}]',
+        f'CREATE TABLE [{tmp_name}] ({col_defs})',
     ])
     col_names = ", ".join([f'[{c}]' for c in cols])
     placeholders = ", ".join(["?" for _ in cols])
-    BATCH = 20  # statements per pipeline call
-    stmts = []
-    for _, row in df.iterrows():
-        args = [_to_turso_arg(v) for v in row]
-        stmts.append({"sql": f"INSERT INTO [{table_name}] ({col_names}) VALUES ({placeholders})", "args": args})
-        if len(stmts) >= BATCH:
-            _turso_http(stmts)
+    BATCH = 20
+    try:
+        for start in range(0, len(df), BATCH):
             stmts = []
-    if stmts:
-        _turso_http(stmts)
+            for _, row in df.iloc[start:start + BATCH].iterrows():
+                args = [_to_turso_arg(v) for v in row]
+                stmts.append({"sql": f"INSERT INTO [{tmp_name}] ({col_names}) VALUES ({placeholders})", "args": args})
+            _turso_http(stmts)
+        # Todos los INSERTs OK → reemplazar tabla real
+        _turso_http([
+            f'DROP TABLE IF EXISTS [{table_name}]',
+            f'ALTER TABLE [{tmp_name}] RENAME TO [{table_name}]',
+        ])
+    except Exception:
+        # Si falla, limpiar temporal pero no tocar la tabla real
+        try:
+            _turso_http([f'DROP TABLE IF EXISTS [{tmp_name}]'])
+        except Exception:
+            pass
+        raise
 
 
 # ── Funciones de persistencia (dual: Turso + SQLite local) ──
@@ -724,7 +735,10 @@ def db_has_data() -> bool:
 def db_save_main(df: pd.DataFrame):
     """Guarda el DataFrame principal (reemplaza la tabla completa)."""
     if _use_turso():
-        _turso_save_df(df, _TABLE_MAIN)
+        try:
+            _turso_save_df(df, _TABLE_MAIN)
+        except Exception as e:
+            import traceback; traceback.print_exc()
     con = sqlite3.connect(str(_DB_PATH))
     df.to_sql(_TABLE_MAIN, con, if_exists="replace", index=False)
     con.close()
@@ -799,7 +813,10 @@ def db_merge_new_ruts(df_existing: pd.DataFrame, df_excel: pd.DataFrame) -> pd.D
 def db_save_horas(df: pd.DataFrame):
     """Guarda la tabla Horas Indirectas."""
     if _use_turso():
-        _turso_save_df(df, _TABLE_HORAS)
+        try:
+            _turso_save_df(df, _TABLE_HORAS)
+        except Exception as e:
+            import traceback; traceback.print_exc()
     con = sqlite3.connect(str(_DB_PATH))
     df.to_sql(_TABLE_HORAS, con, if_exists="replace", index=False)
     con.close()
@@ -833,7 +850,10 @@ def db_load_horas() -> pd.DataFrame | None:
 def db_save_dot(df: pd.DataFrame):
     """Guarda la tabla DOT IDEAL procesada."""
     if _use_turso():
-        _turso_save_df(df, _TABLE_DOT)
+        try:
+            _turso_save_df(df, _TABLE_DOT)
+        except Exception as e:
+            import traceback; traceback.print_exc()
     con = sqlite3.connect(str(_DB_PATH))
     df.to_sql(_TABLE_DOT, con, if_exists="replace", index=False)
     con.close()
