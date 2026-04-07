@@ -12,12 +12,7 @@ from pathlib import Path
 from copy import deepcopy
 import openpyxl
 from openpyxl.utils import get_column_letter
-import warnings, gc, os, sys, shutil, tempfile, sqlite3, io, hmac
-try:
-    import libsql_experimental as libsql
-    _HAS_LIBSQL = True
-except ImportError:
-    _HAS_LIBSQL = False
+import warnings, gc, os, sys, shutil, tempfile, sqlite3, io, hmac, requests as _req
 from datetime import datetime, date, time as dt_time
 from docx import Document as DocxDocument
 from docx.shared import Pt, Inches, Cm, RGBColor
@@ -601,91 +596,127 @@ def save_dot_ideal_sheet(path: str, df_dot_raw: pd.DataFrame):
 
 
 # ─────────────────────────────────────────────────────────────
-# DB PERSISTENCIA  (Turso / SQLite local fallback)
+# DB PERSISTENCIA  (Turso HTTP API / SQLite local fallback)
 # ─────────────────────────────────────────────────────────────
 _TABLE_MAIN = "dotacion_main"
 _TABLE_HORAS = "horas_indirectas"
 _TABLE_DOT = "dot_ideal"
 
-_TURSO_CONN = None
-_USE_TURSO = False
-
-
-def _get_conn():
-    """Retorna conexión a Turso (si hay secrets) o SQLite local."""
-    global _TURSO_CONN, _USE_TURSO
-    turso_url = ""
-    turso_token = ""
+# ── Turso HTTP helpers ──────────────────────────────────────
+def _turso_cfg():
+    """Lee URL y token de secrets (vacío si no configurado)."""
     try:
-        turso_url = st.secrets.get("TURSO_URL", "")
-        turso_token = st.secrets.get("TURSO_TOKEN", "")
+        return st.secrets.get("TURSO_URL", ""), st.secrets.get("TURSO_TOKEN", "")
     except Exception:
-        pass
-    if turso_url and turso_token and _HAS_LIBSQL:
-        _USE_TURSO = True
-        if _TURSO_CONN is None:
-            _TURSO_CONN = libsql.connect(
-                str(_DB_PATH), sync_url=turso_url, auth_token=turso_token
-            )
-            _TURSO_CONN.sync()
-        return _TURSO_CONN
-    else:
-        _USE_TURSO = False
-        return sqlite3.connect(str(_DB_PATH))
+        return "", ""
 
 
-def _close_conn(con):
-    """Cierra la conexión solo si es SQLite local (Turso se reutiliza)."""
-    if not _USE_TURSO:
-        con.close()
+def _use_turso():
+    url, tok = _turso_cfg()
+    return bool(url and tok)
 
 
-def _sync():
-    """Sincroniza con Turso (push/pull) si está activo."""
-    if _TURSO_CONN is not None:
-        _TURSO_CONN.sync()
+def _turso_http(stmts):
+    """Ejecuta lista de sentencias SQL via Turso HTTP pipeline API.
+    stmts: list[str | dict(sql, args)]  →  retorna lista de results.
+    """
+    url, tok = _turso_cfg()
+    endpoint = url.replace("libsql://", "https://").rstrip("/") + "/v2/pipeline"
+    reqs = []
+    for s in stmts:
+        if isinstance(s, str):
+            reqs.append({"type": "execute", "stmt": {"sql": s}})
+        else:
+            reqs.append({"type": "execute", "stmt": s})
+    reqs.append({"type": "close"})
+    r = _req.post(endpoint, json={"requests": reqs},
+                  headers={"Authorization": f"Bearer {tok}"}, timeout=60)
+    r.raise_for_status()
+    out = []
+    for item in r.json().get("results", []):
+        if item.get("type") == "ok":
+            resp = item.get("response", {})
+            if resp.get("type") == "execute":
+                out.append(resp.get("result", {}))
+    return out
 
 
-def _df_to_sql(df: pd.DataFrame, table_name: str, con):
-    """Guarda DataFrame en tabla SQL — compatible con sqlite3 y libsql."""
-    try:
-        df.to_sql(table_name, con, if_exists="replace", index=False)
-    except (TypeError, AttributeError):
-        cur = con.cursor()
-        cur.execute(f'DROP TABLE IF EXISTS [{table_name}]')
-        cols = df.columns.tolist()
-        col_defs = ", ".join([f'[{c}] TEXT' for c in cols])
-        cur.execute(f'CREATE TABLE [{table_name}] ({col_defs})')
-        placeholders = ", ".join(["?" for _ in cols])
-        col_names = ", ".join([f'[{c}]' for c in cols])
-        for _, row in df.iterrows():
-            values = tuple(None if pd.isna(v) else v for v in row)
-            cur.execute(f'INSERT INTO [{table_name}] ({col_names}) VALUES ({placeholders})', values)
-        con.commit()
+def _turso_val(v):
+    t = v.get("type", "null")
+    if t == "null":
+        return None
+    if t == "integer":
+        return int(v["value"])
+    if t == "float":
+        return float(v["value"])
+    return v.get("value")
 
 
-def _read_sql(query: str, con) -> pd.DataFrame:
-    """Lee query SQL a DataFrame — compatible con sqlite3 y libsql."""
-    try:
-        return pd.read_sql(query, con)
-    except (TypeError, AttributeError):
-        cur = con.cursor()
-        cur.execute(query)
-        rows = cur.fetchall()
-        if not rows:
-            return pd.DataFrame()
-        cols = [desc[0] for desc in cur.description]
-        return pd.DataFrame(rows, columns=cols)
+def _turso_query_df(sql):
+    """SELECT → DataFrame via HTTP."""
+    results = _turso_http([sql])
+    if not results:
+        return pd.DataFrame()
+    res = results[0]
+    cols = [c["name"] for c in res.get("cols", [])]
+    rows = [[_turso_val(c) for c in row] for row in res.get("rows", [])]
+    return pd.DataFrame(rows, columns=cols) if cols else pd.DataFrame()
 
+
+def _turso_exec_single(sql):
+    """Ejecuta una sentencia y retorna el primer fila[0] si hay resultado."""
+    results = _turso_http([sql])
+    if results and results[0].get("rows"):
+        row0 = results[0]["rows"][0]
+        return _turso_val(row0[0])
+    return None
+
+
+def _to_turso_arg(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return {"type": "null"}
+    if isinstance(v, bool):
+        return {"type": "integer", "value": str(int(v))}
+    if isinstance(v, (int, np.integer)):
+        return {"type": "integer", "value": str(int(v))}
+    if isinstance(v, (float, np.floating)):
+        return {"type": "float", "value": str(float(v))}
+    return {"type": "text", "value": str(v)}
+
+
+def _turso_save_df(df, table_name):
+    """Guarda DataFrame completo en Turso via HTTP (DROP+CREATE+INSERT)."""
+    cols = df.columns.tolist()
+    col_defs = ", ".join([f'[{c}] TEXT' for c in cols])
+    _turso_http([
+        f'DROP TABLE IF EXISTS [{table_name}]',
+        f'CREATE TABLE [{table_name}] ({col_defs})',
+    ])
+    col_names = ", ".join([f'[{c}]' for c in cols])
+    BATCH = 80
+    for start in range(0, len(df), BATCH):
+        chunk = df.iloc[start:start + BATCH]
+        ph_row = "(" + ", ".join(["?" for _ in cols]) + ")"
+        ph_all = ", ".join([ph_row] * len(chunk))
+        args = []
+        for _, row in chunk.iterrows():
+            for v in row:
+                args.append(_to_turso_arg(v))
+        _turso_http([{"sql": f"INSERT INTO [{table_name}] ({col_names}) VALUES {ph_all}", "args": args}])
+
+
+# ── Funciones de persistencia (dual: Turso + SQLite local) ──
 
 def db_has_data() -> bool:
     """Retorna True si la BD tiene registros."""
     try:
-        con = _get_conn()
-        _sync()
+        if _use_turso():
+            n = _turso_exec_single(f"SELECT COUNT(*) FROM {_TABLE_MAIN}")
+            return (n or 0) > 0
+        con = sqlite3.connect(str(_DB_PATH))
         cur = con.execute(f"SELECT COUNT(*) FROM {_TABLE_MAIN}")
         n = cur.fetchone()[0]
-        _close_conn(con)
+        con.close()
         return n > 0
     except Exception:
         return False
@@ -693,10 +724,11 @@ def db_has_data() -> bool:
 
 def db_save_main(df: pd.DataFrame):
     """Guarda el DataFrame principal (reemplaza la tabla completa)."""
-    con = _get_conn()
-    _df_to_sql(df, _TABLE_MAIN, con)
-    _sync()
-    _close_conn(con)
+    if _use_turso():
+        _turso_save_df(df, _TABLE_MAIN)
+    con = sqlite3.connect(str(_DB_PATH))
+    df.to_sql(_TABLE_MAIN, con, if_exists="replace", index=False)
+    con.close()
 
 
 def _normalize_cesfam_col(df: pd.DataFrame) -> pd.DataFrame:
@@ -715,10 +747,12 @@ def _normalize_cesfam_col(df: pd.DataFrame) -> pd.DataFrame:
 
 def db_load_main() -> pd.DataFrame:
     """Carga el DataFrame principal desde la BD."""
-    con = _get_conn()
-    _sync()
-    df = _read_sql(f"SELECT * FROM {_TABLE_MAIN}", con)
-    _close_conn(con)
+    if _use_turso():
+        df = _turso_query_df(f"SELECT * FROM {_TABLE_MAIN}")
+    else:
+        con = sqlite3.connect(str(_DB_PATH))
+        df = pd.read_sql(f"SELECT * FROM {_TABLE_MAIN}", con)
+        con.close()
     # Restaurar tipos numéricos
     for col in ["Horas por contrato", "Horas Totales",
                 "Total Descuentos semanal (horas)", "Total Horas Clínicas"]:
@@ -765,23 +799,29 @@ def db_merge_new_ruts(df_existing: pd.DataFrame, df_excel: pd.DataFrame) -> pd.D
 
 def db_save_horas(df: pd.DataFrame):
     """Guarda la tabla Horas Indirectas."""
-    con = _get_conn()
-    _df_to_sql(df, _TABLE_HORAS, con)
-    _sync()
-    _close_conn(con)
+    if _use_turso():
+        _turso_save_df(df, _TABLE_HORAS)
+    con = sqlite3.connect(str(_DB_PATH))
+    df.to_sql(_TABLE_HORAS, con, if_exists="replace", index=False)
+    con.close()
 
 
 def db_load_horas() -> pd.DataFrame | None:
     """Carga Horas Indirectas desde la BD."""
     try:
-        con = _get_conn()
-        _sync()
-        cur = con.execute(f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{_TABLE_HORAS}'")
-        if cur.fetchone()[0] == 0:
-            _close_conn(con)
-            return None
-        df = _read_sql(f"SELECT * FROM {_TABLE_HORAS}", con)
-        _close_conn(con)
+        if _use_turso():
+            n = _turso_exec_single(f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{_TABLE_HORAS}'")
+            if not n:
+                return None
+            df = _turso_query_df(f"SELECT * FROM {_TABLE_HORAS}")
+        else:
+            con = sqlite3.connect(str(_DB_PATH))
+            cur = con.execute(f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{_TABLE_HORAS}'")
+            if cur.fetchone()[0] == 0:
+                con.close()
+                return None
+            df = pd.read_sql(f"SELECT * FROM {_TABLE_HORAS}", con)
+            con.close()
         if df.empty:
             return None
         for col in df.columns[1:]:
@@ -793,23 +833,29 @@ def db_load_horas() -> pd.DataFrame | None:
 
 def db_save_dot(df: pd.DataFrame):
     """Guarda la tabla DOT IDEAL procesada."""
-    con = _get_conn()
-    _df_to_sql(df, _TABLE_DOT, con)
-    _sync()
-    _close_conn(con)
+    if _use_turso():
+        _turso_save_df(df, _TABLE_DOT)
+    con = sqlite3.connect(str(_DB_PATH))
+    df.to_sql(_TABLE_DOT, con, if_exists="replace", index=False)
+    con.close()
 
 
 def db_load_dot() -> pd.DataFrame | None:
     """Carga DOT IDEAL desde la BD."""
     try:
-        con = _get_conn()
-        _sync()
-        cur = con.execute(f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{_TABLE_DOT}'")
-        if cur.fetchone()[0] == 0:
-            _close_conn(con)
-            return None
-        df = _read_sql(f"SELECT * FROM {_TABLE_DOT}", con)
-        _close_conn(con)
+        if _use_turso():
+            n = _turso_exec_single(f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{_TABLE_DOT}'")
+            if not n:
+                return None
+            df = _turso_query_df(f"SELECT * FROM {_TABLE_DOT}")
+        else:
+            con = sqlite3.connect(str(_DB_PATH))
+            cur = con.execute(f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{_TABLE_DOT}'")
+            if cur.fetchone()[0] == 0:
+                con.close()
+                return None
+            df = pd.read_sql(f"SELECT * FROM {_TABLE_DOT}", con)
+            con.close()
         if df.empty:
             return None
         for col in df.columns:
