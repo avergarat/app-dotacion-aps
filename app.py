@@ -18,6 +18,8 @@ from docx import Document as DocxDocument
 from docx.shared import Pt, Inches, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, JsCode
+
 warnings.filterwarnings("ignore")
 
 # Directorio de trabajo temporal para copias del Excel
@@ -1735,39 +1737,86 @@ def page_editor(filtros):
     else:
         dff_edit.insert(0, "🆕", "")
 
-    # ── Tabla editable (st.data_editor nativo) ──
-    column_config = {
-        "🆕": st.column_config.TextColumn("Nuevo", width="small"),
-        "REVISADO": st.column_config.SelectboxColumn("Rev", options=["", "OK"], width="small"),
-        "TIPO": st.column_config.TextColumn("Tipo", width="small"),
-        "RUT": st.column_config.TextColumn("RUT", width="small"),
-        "NOMBRE PROFESIONAL": st.column_config.TextColumn("Nombre", width="large"),
-        "CESFAM": st.column_config.TextColumn("CESFAM"),
-        "DESCRIPCIÓN DE PLANTA": st.column_config.TextColumn("Planta"),
-        "CARGO": st.column_config.TextColumn("Cargo"),
-        "UNIDAD DE DESEMPEÑO": st.column_config.TextColumn("Unidad"),
-        "ENCOMENDACIONES": st.column_config.TextColumn("Encomendaciones", width="large"),
-        "OBSERVACIONES": st.column_config.TextColumn("Obs."),
-        "Horas por contrato": st.column_config.NumberColumn("Hrs Contr.", format="%.1f"),
-        "Horas Totales": st.column_config.NumberColumn("Hrs Tot.", format="%.1f"),
-        "Total Descuentos semanal (horas)": st.column_config.NumberColumn("Desc.", format="%.1f"),
-        "Total Horas Clínicas": st.column_config.NumberColumn("Hrs Clín.", format="%.1f"),
-        "_real_idx": None,
+    # ── Configurar AG Grid ──
+    gb = GridOptionsBuilder.from_dataframe(dff_edit)
+    gb.configure_default_column(editable=True, resizable=True, sortable=True, filter=True, minWidth=80)
+
+    # Columnas fijas a la izquierda (frozen)
+    gb.configure_column("🆕", pinned="left", width=60, editable=False, headerName="Nuevo")
+    gb.configure_column("REVISADO", pinned="left", width=80, headerName="Rev",
+                        cellEditor="agSelectCellEditor",
+                        cellEditorParams={"values": ["", "OK"]})
+    gb.configure_column("NOMBRE PROFESIONAL", pinned="left", width=220, headerName="Nombre")
+    gb.configure_column("TIPO", pinned="left", width=70, headerName="Tipo")
+    gb.configure_column("RUT", pinned="left", width=100, headerName="RUT")
+
+    # Columnas no fijas
+    gb.configure_column("CESFAM", width=140, headerName="CESFAM")
+    gb.configure_column("CARGO", width=160, headerName="Cargo")
+    gb.configure_column("DESCRIPCIÓN DE PLANTA", width=140, headerName="Planta")
+    gb.configure_column("UNIDAD DE DESEMPEÑO", width=160, headerName="Unidad")
+    gb.configure_column("ENCOMENDACIONES", width=300, headerName="Encomendaciones")
+    gb.configure_column("OBSERVACIONES", width=200, headerName="Obs.")
+    _fmt1 = JsCode("function(p){return p.value!=null? Number(p.value).toFixed(1): ''}")
+    gb.configure_column("Horas por contrato", width=100, headerName="Hrs Contr.",
+                        type=["numericColumn"], valueParser="Number(newValue)",
+                        valueFormatter=_fmt1)
+    gb.configure_column("Horas Totales", width=100, headerName="Hrs Tot.",
+                        type=["numericColumn"], valueParser="Number(newValue)",
+                        valueFormatter=_fmt1)
+    gb.configure_column("Total Descuentos semanal (horas)", width=100, headerName="Desc.",
+                        type=["numericColumn"], valueParser="Number(newValue)",
+                        valueFormatter=_fmt1)
+    gb.configure_column("Total Horas Clínicas", width=100, headerName="Hrs Clín.",
+                        type=["numericColumn"], valueParser="Number(newValue)",
+                        valueFormatter=_fmt1)
+    # Ocultar columna auxiliar de índice
+    gb.configure_column("_real_idx", hide=True)
+
+    # Selección de fila con checkbox para encomendaciones
+    gb.configure_selection("single", use_checkbox=True)
+
+    grid_options = gb.build()
+
+    # CSS corporativo para los encabezados AG Grid
+    custom_css = {
+        ".ag-header-cell": {
+            "background": "linear-gradient(135deg, #0A2E1F, #145A38) !important",
+        },
+        ".ag-header-cell-label": {
+            "color": "#4ADE80 !important",
+            "font-weight": "700 !important",
+            "font-size": "0.78rem !important",
+            "letter-spacing": "0.3px",
+        },
+        ".ag-header": {
+            "border-bottom": "2px solid #4ADE80 !important",
+        },
+        ".ag-row-selected": {
+            "background-color": "#F0FDF4 !important",
+            "border-left": "3px solid #4ADE80 !important",
+        },
+        ".ag-root-wrapper": {
+            "border": "2px solid #0A2E1F !important",
+            "border-radius": "8px !important",
+        },
     }
 
-    edited_df = st.data_editor(
+    response = AgGrid(
         dff_edit,
-        column_config=column_config,
-        use_container_width=True,
+        gridOptions=grid_options,
+        update_mode=GridUpdateMode.MODEL_CHANGED,
+        data_return_mode=DataReturnMode.AS_INPUT,
         height=500,
-        num_rows="fixed",
-        hide_index=True,
-        disabled=["🆕", "_real_idx"],
-        key=f"editor_main_{st.session_state.get('_ag_version', 0)}",
+        theme="alpine",
+        custom_css=custom_css,
+        allow_unsafe_jscode=True,
+        key=f"ag_main_{st.session_state.get('_ag_version', 0)}",
     )
 
     # ── Sincronizar ediciones del usuario ──
-    if edited_df is not None and not edited_df.empty:
+    edited_df = response.data if hasattr(response, "data") else None
+    if isinstance(edited_df, pd.DataFrame) and not edited_df.empty:
         for col in all_cols:
             if col not in edited_df.columns:
                 continue
@@ -1795,35 +1844,26 @@ def page_editor(filtros):
         st.session_state["_ag_version"] = st.session_state.get("_ag_version", 0) + 1
         st.rerun()
 
-    # ── Seleccionar persona para encomendaciones ──
-    _ruts = dff["RUT"].fillna("").astype(str).str.strip()
-    _noms = dff["NOMBRE PROFESIONAL"].fillna("").astype(str).str.strip() if "NOMBRE PROFESIONAL" in dff.columns else pd.Series("", index=dff.index)
-    _cess = dff["CESFAM"].fillna("").astype(str).str.strip() if "CESFAM" in dff.columns else pd.Series("", index=dff.index)
-    _persona_labels = (_ruts + " — " + _noms + " (" + _cess + ")").tolist()
-    _persona_opts = ["(Seleccione una persona)"] + _persona_labels
+    # ── Detectar fila seleccionada para encomendaciones ──
+    selected = response.selected_rows if hasattr(response, "selected_rows") else None
+    _has_sel = False
+    sel_row_data = None
+    try:
+        if selected is not None:
+            if isinstance(selected, pd.DataFrame) and len(selected) > 0:
+                _has_sel = True
+                sel_row_data = selected.iloc[0]
+            elif isinstance(selected, list) and len(selected) > 0:
+                _has_sel = True
+                sel_row_data = pd.Series(selected[0])
+    except Exception:
+        _has_sel = False
 
-    _prev_rut = st.session_state.get("_sel_rut", None)
-    _default_idx = 0
-    if _prev_rut:
-        _pref = str(_prev_rut)
-        for _pi, _po in enumerate(_persona_opts):
-            if _po.startswith(_pref + " ") or _po.startswith(_pref + " —"):
-                _default_idx = _pi
-                break
+    if _has_sel and sel_row_data is not None:
+        sel_rut = str(sel_row_data.get("RUT", "")).strip()
+        st.session_state["_sel_rut"] = sel_rut
 
-    with encom_editor_container:
-        _sel_person = st.selectbox(
-            "👤 Seleccionar persona para asignar encomendaciones",
-            _persona_opts, index=_default_idx,
-            key="sel_persona_editor",
-        )
-
-    if _sel_person and _sel_person != "(Seleccione una persona)":
-        st.session_state["_sel_rut"] = _sel_person.split(" — ")[0].strip()
-    else:
-        st.session_state.pop("_sel_rut", None)
-
-    # Usar la última selección guardada
+    # Usar la última selección guardada (persiste aunque se deseleccione)
     _active_rut = st.session_state.get("_sel_rut", None)
     if _active_rut:
         match_mask = dff["RUT"].astype(str).str.strip() == _active_rut
