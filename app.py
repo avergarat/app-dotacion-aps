@@ -1652,69 +1652,6 @@ def page_editor(filtros):
 
     st.markdown('<div class="section-title">Tabla Editable — Doble clic en celda para editar · Seleccione fila para asignar encomendaciones</div>', unsafe_allow_html=True)
 
-
-    # ── Editor de encomendaciones (ANTES de la tabla, solo usa la fila seleccionada) ──
-    encom_editor_container = st.container()
-    _active_rut = st.session_state.get("_sel_rut", None)
-    row = None
-    real_idx = None
-    if _active_rut:
-        match_mask = df["RUT"].astype(str).str.strip() == _active_rut
-        if match_mask.any():
-            real_idx = df[match_mask].index[0]
-            row = df.loc[real_idx]
-        else:
-            # Si el RUT seleccionado ya no está, limpiar selección
-            st.session_state.pop("_sel_rut", None)
-    with encom_editor_container:
-        if row is not None:
-            nombre = str(row.get("NOMBRE PROFESIONAL", "")) if pd.notna(row.get("NOMBRE PROFESIONAL")) else ""
-            rut = str(row.get("RUT", "")) if pd.notna(row.get("RUT")) else ""
-            cargo = str(row.get("CARGO", "")) if pd.notna(row.get("CARGO")) else ""
-            cesfam = str(row.get("CESFAM", "")) if pd.notna(row.get("CESFAM")) else ""
-            hrs_tot = float(row.get("Horas Totales", 0)) if pd.notna(row.get("Horas Totales")) else 0
-            lookup = st.session_state.horas_lookup
-            activity_names = sorted(lookup.keys())
-            current_encom_str = str(row.get("ENCOMENDACIONES", "")) if pd.notna(row.get("ENCOMENDACIONES")) else ""
-            current_items = [x.strip() for x in current_encom_str.split("|") if x.strip()] if current_encom_str.strip() else []
-            st.markdown(f"""<div style="background:#F0FDF4; border:1px solid #4ADE80; padding:.5rem .8rem;
-                        border-radius:6px; margin:.3rem 0 .5rem 0;">
-                <span style="color:#0A2E1F; font-weight:600;">✏️ {nombre}</span>
-                <span style="color:#666; font-size:.82rem;"> · {rut} · {cargo} · {cesfam} · {hrs_tot:.0f} hrs</span>
-            </div>""", unsafe_allow_html=True)
-            new_items = st.multiselect(
-                "🔍 Encomendaciones (escriba para buscar actividades)",
-                options=activity_names,
-                default=[x for x in current_items if x in activity_names],
-                key=f"encom_ms_{real_idx}",
-                placeholder="Escriba para buscar y agregar actividades...",
-            )
-            total_desc = sum(lookup.get(item, 0) for item in new_items)
-            hrs_cli = hrs_tot - total_desc
-            jornadas = hrs_cli / 44 if hrs_cli > 0 else 0
-            info_col, btn_col = st.columns([4, 1])
-            with info_col:
-                st.caption(f"Descuentos: {total_desc:.2f} · Hrs Clínicas: {hrs_cli:.2f} · Jornadas: {jornadas:.2f} · Actividades: {len(new_items)}")
-            with btn_col:
-                new_encom_str = " | ".join(sorted(new_items))
-                old_sorted = " | ".join(sorted(current_items))
-                if new_encom_str != old_sorted:
-                    if st.button("✅ Aplicar", type="primary", key=f"apply_{real_idx}"):
-                        st.session_state.df_main.at[real_idx, "ENCOMENDACIONES"] = new_encom_str
-                        st.session_state.df_main.at[real_idx, "Total Descuentos semanal (horas)"] = total_desc
-                        st.session_state.df_main.at[real_idx, "Total Horas Clínicas"] = hrs_cli
-                        st.session_state.df_main.at[real_idx, "REVISADO"] = "OK"
-                        db_save_main(st.session_state.df_main)
-                        st.session_state.dirty_main = False
-                        st.session_state["_ag_version"] = st.session_state.get("_ag_version", 0) + 1
-                        st.toast(f"Encomendaciones de {nombre} guardadas", icon="💾")
-                        st.rerun()
-        else:
-            st.markdown("""<div style="background:#F0FDF4; border:1px solid #BBF7D0; padding:.6rem 1rem;
-                border-radius:8px; color:#666; font-size:.85rem;">
-                ℹ️ Seleccione una fila para editar encomendaciones.
-            </div>""", unsafe_allow_html=True)
-
     # Columnas a mostrar
     display_cols = ["REVISADO", "TIPO", "RUT", "CESFAM", "NOMBRE PROFESIONAL",
                     "DESCRIPCIÓN DE PLANTA", "CARGO", "UNIDAD DE DESEMPEÑO",
@@ -1839,27 +1776,28 @@ def page_editor(filtros):
         key=f"ag_main_{st.session_state.get('_ag_version', 0)}",
     )
 
-    # Solo sincronizar selección, no todo el estado
+    # ── 1. Procesar selección de fila (actualiza _sel_rut AHORA) ──
     selected = response.selected_rows if hasattr(response, "selected_rows") else None
     if selected is not None:
         if isinstance(selected, pd.DataFrame) and len(selected) > 0:
-            sel_row_data = selected.iloc[0]
-            sel_rut = str(sel_row_data.get("RUT", "")).strip()
-            st.session_state["_sel_rut"] = sel_rut
+            sel_rut = str(selected.iloc[0].get("RUT", "")).strip()
+            if sel_rut:
+                st.session_state["_sel_rut"] = sel_rut
         elif isinstance(selected, list) and len(selected) > 0:
-            sel_row_data = selected[0]
-            sel_rut = str(sel_row_data.get("RUT", "")).strip()
-            st.session_state["_sel_rut"] = sel_rut
+            sel_rut = str(selected[0].get("RUT", "")).strip()
+            if sel_rut:
+                st.session_state["_sel_rut"] = sel_rut
 
-    # Sincronizar ediciones SOLO si hay cambios
+    # ── 2. Sincronizar ediciones de celdas (comparar solo contra dff_page) ──
     edited_df = response.data if hasattr(response, "data") else None
     if isinstance(edited_df, pd.DataFrame) and not edited_df.empty:
+        n_compare = min(len(dff_page), len(edited_df))
         for col in all_cols:
             if col not in edited_df.columns:
                 continue
-            for i in range(min(len(dff), len(edited_df))):
-                real_idx_i = dff.index[i]
-                sent_val = dff.iloc[i][col]
+            for i in range(n_compare):
+                real_idx_i = dff_page.index[i]
+                sent_val = dff_page.iloc[i][col]
                 grid_val = edited_df.iloc[i][col]
                 sent_s = str(sent_val) if pd.notna(sent_val) else ""
                 grid_s = str(grid_val) if pd.notna(grid_val) else ""
@@ -1874,11 +1812,72 @@ def page_editor(filtros):
                         st.session_state.df_main.at[real_idx_i, "Total Horas Clínicas"] = ht - td
                     st.session_state.dirty_main = True
 
+    # Guardar cambios inline sin reiniciar el grid (no incrementar _ag_version)
     if st.session_state.dirty_main:
         db_save_main(st.session_state.df_main)
         st.session_state.dirty_main = False
-        st.session_state["_ag_version"] = st.session_state.get("_ag_version", 0) + 1
-        st.rerun()
+
+    # ── 3. Editor de encomendaciones — DESPUÉS del AgGrid con _sel_rut ya actualizado ──
+    st.markdown('<div class="section-title">Encomendaciones — Fila seleccionada</div>', unsafe_allow_html=True)
+    _active_rut = st.session_state.get("_sel_rut", None)
+    _row = None
+    _real_idx = None
+    if _active_rut:
+        _match = df["RUT"].astype(str).str.strip() == _active_rut
+        if _match.any():
+            _real_idx = df[_match].index[0]
+            _row = df.loc[_real_idx]
+        else:
+            st.session_state.pop("_sel_rut", None)
+
+    if _row is not None:
+        _nombre = str(_row.get("NOMBRE PROFESIONAL", "")) if pd.notna(_row.get("NOMBRE PROFESIONAL")) else ""
+        _rut    = str(_row.get("RUT", "")) if pd.notna(_row.get("RUT")) else ""
+        _cargo  = str(_row.get("CARGO", "")) if pd.notna(_row.get("CARGO")) else ""
+        _cesfam = str(_row.get("CESFAM", "")) if pd.notna(_row.get("CESFAM")) else ""
+        _hrs_tot = float(_row.get("Horas Totales", 0)) if pd.notna(_row.get("Horas Totales")) else 0
+        _lookup = st.session_state.horas_lookup
+        _activity_names = sorted(_lookup.keys())
+        _cur_encom = str(_row.get("ENCOMENDACIONES", "")) if pd.notna(_row.get("ENCOMENDACIONES")) else ""
+        _cur_items = [x.strip() for x in _cur_encom.split("|") if x.strip()] if _cur_encom.strip() else []
+
+        st.markdown(f"""<div style="background:#F0FDF4; border:1px solid #4ADE80; padding:.5rem .8rem;
+                    border-radius:6px; margin:.3rem 0 .5rem 0;">
+            <span style="color:#0A2E1F; font-weight:600;">✏️ {_nombre}</span>
+            <span style="color:#666; font-size:.82rem;"> · {_rut} · {_cargo} · {_cesfam} · {_hrs_tot:.0f} hrs</span>
+        </div>""", unsafe_allow_html=True)
+
+        _new_items = st.multiselect(
+            "🔍 Encomendaciones (escriba para buscar actividades)",
+            options=_activity_names,
+            default=[x for x in _cur_items if x in _activity_names],
+            key=f"encom_ms_{_real_idx}",
+            placeholder="Escriba para buscar y agregar actividades...",
+        )
+        _total_desc = sum(_lookup.get(item, 0) for item in _new_items)
+        _hrs_cli = _hrs_tot - _total_desc
+        _jornadas = _hrs_cli / 44 if _hrs_cli > 0 else 0
+        _info_col, _btn_col = st.columns([4, 1])
+        with _info_col:
+            st.caption(f"Descuentos: {_total_desc:.2f} · Hrs Clínicas: {_hrs_cli:.2f} · Jornadas: {_jornadas:.2f} · Actividades: {len(_new_items)}")
+        with _btn_col:
+            _new_encom_str = " | ".join(sorted(_new_items))
+            _old_sorted    = " | ".join(sorted(_cur_items))
+            if _new_encom_str != _old_sorted:
+                if st.button("✅ Aplicar", type="primary", key=f"apply_{_real_idx}"):
+                    st.session_state.df_main.at[_real_idx, "ENCOMENDACIONES"] = _new_encom_str
+                    st.session_state.df_main.at[_real_idx, "Total Descuentos semanal (horas)"] = _total_desc
+                    st.session_state.df_main.at[_real_idx, "Total Horas Clínicas"] = _hrs_cli
+                    st.session_state.df_main.at[_real_idx, "REVISADO"] = "OK"
+                    db_save_main(st.session_state.df_main)
+                    st.session_state["_ag_version"] = st.session_state.get("_ag_version", 0) + 1
+                    st.toast(f"Encomendaciones de {_nombre} guardadas", icon="💾")
+                    st.rerun()
+    else:
+        st.markdown("""<div style="background:#F0FDF4; border:1px solid #BBF7D0; padding:.6rem 1rem;
+            border-radius:8px; color:#666; font-size:.85rem;">
+            ℹ️ Seleccione una fila en la tabla para editar encomendaciones.
+        </div>""", unsafe_allow_html=True)
 
 
 def recalculate_hours(df: pd.DataFrame):
