@@ -720,12 +720,27 @@ def _turso_save_df(df, table_name):
 # ── Funciones de persistencia (dual: Turso + SQLite local) ──
 
 def db_has_data() -> bool:
-    """Retorna True si la BD tiene registros."""
-    try:
-        if _use_turso():
+    """Retorna True si la BD tiene registros (Turso con fallback a SQLite local)."""
+    # 1) Intentar Turso si está configurado
+    if _use_turso():
+        try:
             n = _turso_exec_single(f"SELECT COUNT(*) FROM {_TABLE_MAIN}")
-            return (n or 0) > 0
+            if (n or 0) > 0:
+                return True
+            # Turso vacío → verificar SQLite local como fallback
+        except Exception:
+            pass  # Turso inaccesible → continuar con SQLite
+    # 2) SQLite local (siempre como fuente de verdad de respaldo)
+    try:
+        if not _DB_PATH.exists():
+            return False
         con = sqlite3.connect(str(_DB_PATH))
+        cur = con.execute(
+            f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{_TABLE_MAIN}'"
+        )
+        if cur.fetchone()[0] == 0:
+            con.close()
+            return False
         cur = con.execute(f"SELECT COUNT(*) FROM {_TABLE_MAIN}")
         n = cur.fetchone()[0]
         con.close()
@@ -760,14 +775,27 @@ def _normalize_cesfam_col(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def db_load_main() -> pd.DataFrame:
-    """Carga el DataFrame principal desde la BD."""
-    if _use_turso():
-        df = _turso_query_df(f"SELECT * FROM {_TABLE_MAIN}")
-    else:
+def _sqlite_load_table(table: str) -> pd.DataFrame:
+    """Lee una tabla desde SQLite local. Retorna DataFrame vacío si falla."""
+    try:
         con = sqlite3.connect(str(_DB_PATH))
-        df = pd.read_sql(f"SELECT * FROM {_TABLE_MAIN}", con)
+        df = pd.read_sql(f"SELECT * FROM [{table}]", con)
         con.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def db_load_main() -> pd.DataFrame:
+    """Carga el DataFrame principal (Turso con fallback a SQLite local)."""
+    df = pd.DataFrame()
+    if _use_turso():
+        try:
+            df = _turso_query_df(f"SELECT * FROM {_TABLE_MAIN}")
+        except Exception:
+            pass
+    if df.empty:
+        df = _sqlite_load_table(_TABLE_MAIN)
     # Restaurar tipos numéricos
     for col in ["Horas por contrato", "Horas Totales",
                 "Total Descuentos semanal (horas)", "Total Horas Clínicas"]:
@@ -827,28 +855,20 @@ def db_save_horas(df: pd.DataFrame):
 
 
 def db_load_horas() -> pd.DataFrame | None:
-    """Carga Horas Indirectas desde la BD."""
-    try:
-        if _use_turso():
-            n = _turso_exec_single(f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{_TABLE_HORAS}'")
-            if not n:
-                return None
+    """Carga Horas Indirectas (Turso con fallback a SQLite local)."""
+    df = pd.DataFrame()
+    if _use_turso():
+        try:
             df = _turso_query_df(f"SELECT * FROM {_TABLE_HORAS}")
-        else:
-            con = sqlite3.connect(str(_DB_PATH))
-            cur = con.execute(f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{_TABLE_HORAS}'")
-            if cur.fetchone()[0] == 0:
-                con.close()
-                return None
-            df = pd.read_sql(f"SELECT * FROM {_TABLE_HORAS}", con)
-            con.close()
-        if df.empty:
-            return None
-        for col in df.columns[1:]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df
-    except Exception:
+        except Exception:
+            pass
+    if df.empty:
+        df = _sqlite_load_table(_TABLE_HORAS)
+    if df.empty:
         return None
+    for col in df.columns[1:]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
 
 def db_save_dot(df: pd.DataFrame):
@@ -864,29 +884,21 @@ def db_save_dot(df: pd.DataFrame):
 
 
 def db_load_dot() -> pd.DataFrame | None:
-    """Carga DOT IDEAL desde la BD."""
-    try:
-        if _use_turso():
-            n = _turso_exec_single(f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{_TABLE_DOT}'")
-            if not n:
-                return None
+    """Carga DOT IDEAL (Turso con fallback a SQLite local)."""
+    df = pd.DataFrame()
+    if _use_turso():
+        try:
             df = _turso_query_df(f"SELECT * FROM {_TABLE_DOT}")
-        else:
-            con = sqlite3.connect(str(_DB_PATH))
-            cur = con.execute(f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{_TABLE_DOT}'")
-            if cur.fetchone()[0] == 0:
-                con.close()
-                return None
-            df = pd.read_sql(f"SELECT * FROM {_TABLE_DOT}", con)
-            con.close()
-        if df.empty:
-            return None
-        for col in df.columns:
-            if col not in ["CESFAM", "CECOSF", "SECTORES"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df
-    except Exception:
+        except Exception:
+            pass
+    if df.empty:
+        df = _sqlite_load_table(_TABLE_DOT)
+    if df.empty:
         return None
+    for col in df.columns:
+        if col not in ["CESFAM", "CECOSF", "SECTORES"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
 
 def db_export_excel(df: pd.DataFrame) -> bytes:
@@ -995,7 +1007,12 @@ def _load_secondary_sheets():
     """Carga Horas Indirectas y DOT IDEAL desde Excel y persiste en SQLite."""
     path = st.session_state.excel_path
     if path is None:
-        return
+        # Intentar ubicación conocida del archivo como fallback
+        _found = find_excel_file()
+        if _found:
+            path = str(_found)
+        else:
+            return
     p = Path(path)
     if not p.exists():
         return
